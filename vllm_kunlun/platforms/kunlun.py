@@ -2,6 +2,8 @@
 
 from typing import TYPE_CHECKING, Optional
 
+import os
+
 import psutil
 import torch
 import vllm.envs as envs
@@ -26,6 +28,7 @@ class KunlunPlatform(Platform):
     dist_backend: str = "nccl"
     ray_device_key: str = "GPU"
     device_name: str = "cuda"
+    dispatch_key: str = "CUDA"
 
     @property
     def device_type(self):
@@ -35,6 +38,33 @@ class KunlunPlatform(Platform):
         The device type is always ``"cuda"``.
         """
         return "cuda"
+
+    @classmethod
+    def import_kernels(cls) -> None:
+        """Import Kunlun-specific custom ops.
+
+        Override the default implementation to AVOID loading vllm's
+        prebuilt ``vllm._C`` / ``vllm._moe_C`` (which are NVIDIA-only and
+        will pre-register CUDA kernels that clash with vllm_kunlun's
+        ``@custom_op`` / ``@impl(..., "CUDA")`` registrations on
+        PyTorch 2.9+).
+
+        The Kunlun ops themselves are registered eagerly inside
+        ``vllm_kunlun.__init__.register()`` (via ``import vllm_kunlun.ops``)
+        BEFORE ``vllm._custom_ops`` ever gets imported, so by the time
+        this method is invoked all 54 ops are already in
+        ``torch.ops._C`` / ``torch.ops._moe_C``. Here we only need to
+        stub out ``vllm._C`` / ``vllm._moe_C`` so that other vllm code
+        paths (e.g. ``vllm.platforms.cuda`` top-level
+        ``import vllm._C``) do not trigger loading the prebuilt
+        NVIDIA kernels.
+        """
+        import sys
+        import types
+
+        for stub in ("vllm._C", "vllm._moe_C"):
+            if stub not in sys.modules:
+                sys.modules[stub] = types.ModuleType(stub)
 
     def is_kunlun(self) -> bool:
         """is_kunlun"""
@@ -104,6 +134,12 @@ class KunlunPlatform(Platform):
     @classmethod
     def get_static_graph_wrapper_cls(cls) -> str:
         return "vllm.compilation.cuda_graph.CUDAGraphWrapper"  # noqa
+
+    @classmethod
+    def num_compute_units(cls, device_id: int = 0) -> int:
+        """Stub for Kunlun XPU; SM/CU concept not used. Return a reasonable
+        fixed value used only for heuristics in upstream vllm code paths."""
+        return 64
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
@@ -198,30 +234,38 @@ class KunlunPlatform(Platform):
             # if `VLLM_ATTENTION_BACKEND` is not set and we are using MLA, then
             # we default to FlashMLA backend, so we need to force the blocksize
             # here
-            use_sparse = hasattr(vllm_config.model_config.hf_config, "index_topk")
+            hf_config = vllm_config.model_config.hf_config
+            use_sparse = hasattr(hf_config, "index_topk")
+            architectures = getattr(hf_config, "architectures", ()) or ()
+            is_deepseek_v4 = "DeepseekV4ForCausalLM" in architectures
+            mla_block_size = 256 if is_deepseek_v4 else 64
+            attention_backend = os.getenv("VLLM_ATTENTION_BACKEND")
             use_flashmla = (
-                envs.VLLM_ATTENTION_BACKEND is None
-                or envs.VLLM_ATTENTION_BACKEND == "FLASHMLA"
+                attention_backend is None or attention_backend == "FLASHMLA"
             )
-            from vllm.attention.ops.flashmla import is_flashmla_supported
+            from vllm_kunlun.ops.attention.flashmla import is_flashmla_supported
 
             if (
                 use_flashmla
                 and is_flashmla_supported()[0]
-                and cache_config.block_size != 64
+                and cache_config.block_size != mla_block_size
             ):
-                cache_config.block_size = 64
-                logger.info("Forcing kv cache block size to 64 for FlashMLA backend.")
-            if use_sparse and cache_config.block_size != 64:
-                cache_config.block_size = 64
+                cache_config.block_size = mla_block_size
                 logger.info(
-                    "Forcing kv cache block size to 64 for FlashMLASparse " "backend."
+                    "Forcing kv cache block size to %d for FlashMLA backend.",
+                    mla_block_size,
+                )
+            if use_sparse and cache_config.block_size != mla_block_size:
+                cache_config.block_size = mla_block_size
+                logger.info(
+                    "Forcing kv cache block size to %d for FlashMLASparse backend.",
+                    mla_block_size,
                 )
 
         from vllm.config import CUDAGraphMode
 
         if (
-            envs.VLLM_ALL2ALL_BACKEND == "deepep_high_throughput"
+            getattr(envs, "VLLM_ALL2ALL_BACKEND", None) == "deepep_high_throughput"
             and parallel_config.data_parallel_size > 1
             and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
@@ -249,6 +293,8 @@ class KunlunPlatform(Platform):
         cls,
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
+        num_heads: Optional[int] = None,
+        **kwargs,
     ) -> str:
         """
             Returns the class of attention backend based on the selected backend and other parameters.
@@ -331,6 +377,17 @@ class KunlunPlatform(Platform):
         Set the device for the current platform.
         """
         torch.cuda.set_device(device)
+
+    @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        """
+        Set RNG seed across all Kunlun devices.
+        """
+        torch.manual_seed(seed)
+        try:
+            torch.cuda.manual_seed_all(seed)
+        except Exception:
+            pass
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:

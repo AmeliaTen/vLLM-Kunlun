@@ -234,8 +234,8 @@ def flash_mla_sparse_prefill(
     s_q, h_q, d_qk = q.shape
 
     out = torch.zeros([s_q, h_q, d_v], dtype=q.dtype, device=q.device)
-    max_logits = torch.zeros([s_q, h_q], dtype=torch.float32, device=q.device)
-    lse = torch.zeros([s_q, h_q], dtype=torch.float32, device=q.device)
+    max_logits = torch.zeros([s_q, h_q], dtype=q.dtype, device=q.device)
+    lse = torch.zeros([s_q, h_q], dtype=q.dtype, device=q.device)
 
     torch.ops._C.sparse_prefill_fwd_opt(
         q=q,
@@ -257,7 +257,7 @@ def flash_mla_sparse_prefill(
     # out_scale = 1 / math.log2(math.e)
     # gpu_max_logits * out_scale = kunlun_lse
     # gpu_lse * out_scale = kunlun_lse
-    return out, max_logits, lse
+    return out, max_logits.float(), lse.float()
 
 
 #
